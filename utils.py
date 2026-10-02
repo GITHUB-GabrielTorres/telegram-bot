@@ -1,5 +1,15 @@
-from db import get_connection
+from datetime import datetime, timedelta, timezone
 
+
+LOCAL_TZ = timezone(timedelta(hours=-3))
+
+
+def now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
+
+def format_dt(value: datetime) -> str:
+    return value.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
 
 def format_brl(value: float) -> str:
     sign = "-" if value < 0 else ""
@@ -18,13 +28,3 @@ def format_balances_block(
         marker = " <b>(novo)</b>" if name == changed_person else ""
         lines.append(f"{name}{marker}: {format_brl(balance)}")
     return "\n".join(lines)
-
-
-def get_reference_value(key: str) -> float:
-    conn = get_connection()
-    row = conn.execute("SELECT value FROM reference_values WHERE key = ?", (key,)).fetchone()
-    conn.close()
-    if row is None:
-        raise ValueError(f"Valor de referência '{key}' não encontrado.")
-    return row[0]
-

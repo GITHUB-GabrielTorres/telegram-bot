@@ -1,11 +1,26 @@
 from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-
 from telegram.ext import ContextTypes
-from db import get_connection
-from utils import format_brl, format_balances_block, get_reference_value
-from db import get_balances
+
+from db import (
+    create_movement,
+    delete_movement,
+    find_ganhei_id,
+    get_balances,
+    get_ganhei_days,
+    get_movement,
+    get_reference_value,
+    get_user_balance,
+    get_user_name,
+    get_users,
+    list_movements,
+    list_reference_values,
+    register_user,
+    set_reference_value,
+    update_movement_description,
+)
+from utils import format_balances_block, format_brl, format_dt, now_local
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -37,16 +52,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🎓 <code>/cursohoras</code> (<code>/ch</code>) <i>qtd [valor] [descrição]</i> — horas de curso\n"
         "🎧 <code>/podcasthoras</code> (<code>/ph</code>) <i>qtd [valor] [descrição]</i> — horas de podcast\n"
         "📜 <code>/versiculos</code> (<code>/v</code>) <i>qtd [valor] [descrição]</i> — versículos\n"
-        "🏋️ <code>/treinodourado</code> (<code>/td</code>) <i>qtd [valor] [descrição]</i> — treino dourado\n\n"
+        "🏋️ <code>/treinodourado</code> (<code>/td</code>) <i>qtd [valor] [descrição]</i> — treino dourado\n"
+        "🎁 <code>/recompensa_pontual</code> (<code>/rp</code>) <i>valor descrição</i> — recompensa avulsa\n\n"
 
         "🔍 <b>Consulta</b>\n"
         "<code>/historico</code> (<code>/h</code>) [n | m [n] | g [dias]] — lista movimentações ou dias ganhos/perdidos\n"
         "<code>/verid</code> (<code>/vid</code>) <i>id</i> — mostra todos os detalhes de uma movimentação\n\n"
 
         "⚙️ <b>Configuração</b>\n"
-        "<code>/definirrecompensa</code> (<code>/dr</code>) [id valor] — lista ou edita os valores\n"
+        "<code>/definirrecompensa</code> (<code>/dr</code>) [chave valor] — lista ou edita os valores\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -56,48 +73,30 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = context.args[0]
     user_id = update.effective_user.id
 
-    conn = get_connection()
-    conn.execute(
-        """
-        INSERT INTO users (user_id, name) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET name = excluded.name
-        """,
-        (user_id, name),
-    )
-    conn.commit()
-    conn.close()
+    register_user(user_id, name)
 
     await update.message.reply_text(f"Registrado como {name}!")
 
 
 async def definirsaldo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    conn = get_connection()
-    row = conn.execute("SELECT name FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    person = get_user_name(user_id)
 
-    if row is None:
+    if person is None:
         await update.message.reply_text("Você ainda não está registrado. Use /register <nome> primeiro.")
-        conn.close()
         return
-
-    person = row[0]
 
     if not context.args:
         await update.message.reply_text("Uso: /definirsaldo <valor>")
-        conn.close()
         return
 
     try:
         target = float(context.args[0])
     except ValueError:
         await update.message.reply_text("Valor inválido.")
-        conn.close()
         return
 
-    current = conn.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM movements WHERE person = ?", (person,)
-    ).fetchone()[0]
-    conn.close()
+    current = get_user_balance(user_id)
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Confirmar", callback_data=f"setbal:confirm:{target}"),
@@ -122,71 +121,46 @@ async def setbal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     target = float(parts[2])
     user_id = update.effective_user.id
+    person = get_user_name(user_id)
 
-    conn = get_connection()
-    person = conn.execute("SELECT name FROM users WHERE user_id = ?", (user_id,)).fetchone()[0]
-    current = conn.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM movements WHERE person = ?", (person,)
-    ).fetchone()[0]
-
+    current = get_user_balance(user_id)
     diff = target - current
 
-    conn.execute(
-        "INSERT INTO movements (person, amount, description, movement_date) VALUES (?, ?, ?, ?)",
-        (person, diff, "Ajuste de saldo", datetime.now()),
-    )
-    conn.commit()
-    conn.close()
+    create_movement(user_id, diff, "Ajuste de saldo", now_local())
 
     await query.edit_message_text(f"Saldo de {person} ajustado para {format_brl(target)}.")
 
 
 async def ganhei(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    person = get_user_name(user_id)
 
-    conn = get_connection()
-    row = conn.execute("SELECT name FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
-    if row is None:
+    if person is None:
         await update.message.reply_text("Você ainda não está registrado. Use /register <nome> primeiro.")
-        conn.close()
         return
 
-    person = row[0]
+    today = now_local().date()
 
     if context.args and context.args[0].lower() == "ontem":
-        target_date = (datetime.now() - timedelta(days=1)).date()
+        target_date = today - timedelta(days=1)
     else:
-        target_date = datetime.now().date()
+        target_date = today
 
     target_date_iso = target_date.isoformat()
-    is_yesterday = target_date_iso != datetime.now().date().isoformat()
+    is_yesterday = target_date != today
+    label = "ontem" if is_yesterday else "hoje"
 
-    already_used = conn.execute(
-        "SELECT COUNT(*) FROM movements WHERE person = ? AND description = ? AND date(movement_date) = ?",
-        (person, "ganhei", target_date_iso),
-    ).fetchone()[0]
-
-    if already_used:
-        label = "ontem" if is_yesterday else "hoje"
+    if find_ganhei_id(user_id, target_date_iso) is not None:
         await update.message.reply_text(f"{person}, você já usou o /ganhei {label}.")
-        conn.close()
         return
 
     amount = get_reference_value("day")
-    movement_datetime = datetime.combine(target_date, datetime.now().time())
+    movement_datetime = datetime.combine(target_date, now_local().timetz())
 
-    conn.execute(
-        "INSERT INTO movements (person, amount, description, movement_date) VALUES (?, ?, ?, ?)",
-        (person, amount, "ganhei", movement_datetime),
-    )
-    conn.commit()
+    create_movement(user_id, amount, "ganhei", movement_datetime)
 
-    balances = get_balances(conn)
-    conn.close()
-
+    balances = get_balances()
     balances_text = format_balances_block(balances, person)
-    label = "ontem" if is_yesterday else "hoje"
 
     await update.message.reply_text(
         f"{balances_text}\n\n{person} completou o dia de {label} e ganhou {format_brl(amount)}.",
@@ -196,42 +170,32 @@ async def ganhei(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def undo_ganhei(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    person = get_user_name(user_id)
 
-    conn = get_connection()
-    row = conn.execute("SELECT name FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
-    if row is None:
+    if person is None:
         await update.message.reply_text("Você ainda não está registrado. Use /register <nome> primeiro.")
-        conn.close()
         return
 
-    person = row[0]
+    today = now_local().date()
 
     if context.args and context.args[0].lower() == "ontem":
-        target_date = (datetime.now() - timedelta(days=1)).date()
+        target_date = today - timedelta(days=1)
     else:
-        target_date = datetime.now().date()
+        target_date = today
 
     target_date_iso = target_date.isoformat()
-    is_yesterday = target_date_iso != datetime.now().date().isoformat()
+    is_yesterday = target_date != today
     label = "ontem" if is_yesterday else "hoje"
 
-    movement = conn.execute(
-        "SELECT id FROM movements WHERE person = ? AND description = ? AND date(movement_date) = ? ORDER BY id DESC LIMIT 1",
-        (person, "ganhei", target_date_iso),
-    ).fetchone()
+    movement_id = find_ganhei_id(user_id, target_date_iso)
 
-    if movement is None:
+    if movement_id is None:
         await update.message.reply_text(f"{person}, você não usou o /ganhei {label}, nada pra desfazer.")
-        conn.close()
         return
 
-    conn.execute("DELETE FROM movements WHERE id = ?", (movement[0],))
-    conn.commit()
+    delete_movement(movement_id)
 
-    balances = get_balances(conn)
-    conn.close()
-
+    balances = get_balances()
     balances_text = format_balances_block(balances, person)
 
     await update.message.reply_text(
@@ -241,53 +205,38 @@ async def undo_ganhei(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def definirrecompensa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_connection()
+    items = list_reference_values()
 
     if not context.args:
-        rows = conn.execute(
-            "SELECT rowid, key, value FROM reference_values ORDER BY rowid"
-        ).fetchall()
-        conn.close()
-
-        lines = [f"{rowid}) {key} = {value}" for rowid, key, value in rows]
-        await update.message.reply_text("Itens disponíveis:\n\n" + "\n".join(lines))
+        lines = [f"{key} = {value}" for key, value in items]
+        await update.message.reply_text(
+            "Itens disponíveis:\n\n" + "\n".join(lines) + "\n\nUso: /dr <chave> <novo valor>"
+        )
         return
 
     if len(context.args) != 2:
-        conn.close()
-        await update.message.reply_text("Uso: /dr <id> <novo valor>")
+        await update.message.reply_text("Uso: /dr <chave> <novo valor>")
         return
+
+    key = context.args[0]
 
     try:
-        item_id = int(context.args[0])
         value = float(context.args[1])
     except ValueError:
-        conn.close()
-        await update.message.reply_text("Id ou valor inválido.")
+        await update.message.reply_text("Valor inválido.")
         return
 
-    row = conn.execute(
-        "SELECT key FROM reference_values WHERE rowid = ?", (item_id,)
-    ).fetchone()
-
-    if row is None:
-        conn.close()
-        await update.message.reply_text(f"Nenhum item com id {item_id}.")
+    if key not in dict(items):
+        await update.message.reply_text(f"Nenhum item com a chave '{key}'.")
         return
 
-    key = row[0]
-
-    conn.execute("UPDATE reference_values SET value = ? WHERE rowid = ?", (value, item_id))
-    conn.commit()
-    conn.close()
+    set_reference_value(key, value)
 
     await update.message.reply_text(f"{key} atualizado para {value}.")
 
 
 async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_connection()
-    balances = get_balances(conn)
-    conn.close()
+    balances = get_balances()
 
     lines = ["<b>Saldos atuais</b>"]
     lines += [f"{name}: {format_brl(balance)}" for name, balance in balances]
@@ -303,25 +252,19 @@ async def register_reward_movement(
     usage_label: str,
 ) -> None:
     user_id = update.effective_user.id
-    conn = get_connection()
-    row = conn.execute("SELECT name FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    person = get_user_name(user_id)
 
-    if row is None:
-        conn.close()
+    if person is None:
         await update.message.reply_text("Você ainda não está registrado. Use /register <nome> primeiro.")
         return
 
-    person = row[0]
-
     if not context.args:
-        conn.close()
         await update.message.reply_text(f"Uso: /{usage_label} <quantidade> [valor_override] <descrição>")
         return
 
     try:
         quantity = int(context.args[0])
     except ValueError:
-        conn.close()
         await update.message.reply_text("Quantidade inválida.")
         return
 
@@ -339,7 +282,6 @@ async def register_reward_movement(
         description_extra = ""
 
     if not description_extra:
-        conn.close()
         await update.message.reply_text(
             f"Descrição é obrigatória. Uso: /{usage_label} <quantidade> [valor_override] <descrição>"
         )
@@ -348,17 +290,9 @@ async def register_reward_movement(
     amount = quantity * unit_value
     full_description = f"{description}: {description_extra}"
 
-    balances_before = get_balances(conn)
-
-    conn.execute(
-        "INSERT INTO movements (person, amount, description, movement_date) VALUES (?, ?, ?, ?)",
-        (person, amount, full_description, datetime.now()),
-    )
-    conn.commit()
-    movement_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-    balances_after = get_balances(conn)
-    conn.close()
+    balances_before = get_balances()
+    movement_id = create_movement(user_id, amount, full_description, now_local())
+    balances_after = get_balances()
 
     text = (
         f"<b>Movimentação #{movement_id}</b> ({full_description})\n\n"
@@ -400,28 +334,23 @@ async def desfazer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Id inválido.")
         return
 
-    conn = get_connection()
-    movement = conn.execute(
-        "SELECT person, amount, description FROM movements WHERE id = ?", (movement_id,)
-    ).fetchone()
+    movement = get_movement(movement_id)
 
     if movement is None:
-        conn.close()
         await update.message.reply_text(f"Nenhuma movimentação com id {movement_id}.")
         return
 
-    person, amount, description = movement
+    owner_name = get_user_name(movement["user_id"]) or str(movement["user_id"])
 
-    balances_before = get_balances(conn)
-    conn.execute("DELETE FROM movements WHERE id = ?", (movement_id,))
-    conn.commit()
-    balances_after = get_balances(conn)
-    conn.close()
+    balances_before = get_balances()
+    delete_movement(movement_id)
+    balances_after = get_balances()
 
     text = (
-        f"<b>Movimentação #{movement_id} desfeita</b> ({description}, {format_brl(amount)})\n\n"
+        f"<b>Movimentação #{movement_id} desfeita</b> "
+        f"({movement['description']}, {format_brl(movement['amount'])})\n\n"
         f"{format_balances_block(balances_before, title='Saldo antes')}\n\n"
-        f"{format_balances_block(balances_after, person, title='Saldo depois')}"
+        f"{format_balances_block(balances_after, owner_name, title='Saldo depois')}"
     )
 
     await update.message.reply_text(text, parse_mode="HTML")
@@ -429,45 +358,65 @@ async def desfazer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def gasto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    conn = get_connection()
-    row = conn.execute("SELECT name FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    person = get_user_name(user_id)
 
-    if row is None:
-        conn.close()
+    if person is None:
         await update.message.reply_text("Você ainda não está registrado. Use /register <nome> primeiro.")
         return
 
-    person = row[0]
-
     if len(context.args) < 2:
-        conn.close()
         await update.message.reply_text("Uso: /gasto <valor> <descrição>")
         return
 
     try:
         value = float(context.args[0])
     except ValueError:
-        conn.close()
         await update.message.reply_text("Valor inválido.")
         return
 
     description = " ".join(context.args[1:])
     amount = -abs(value)
 
-    balances_before = get_balances(conn)
-
-    conn.execute(
-        "INSERT INTO movements (person, amount, description, movement_date) VALUES (?, ?, ?, ?)",
-        (person, amount, description, datetime.now()),
-    )
-    conn.commit()
-    movement_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-    balances_after = get_balances(conn)
-    conn.close()
+    balances_before = get_balances()
+    movement_id = create_movement(user_id, amount, description, now_local())
+    balances_after = get_balances()
 
     text = (
         f"💸 <b>Movimentação #{movement_id}</b> ({description})\n\n"
+        f"{format_balances_block(balances_before, title='Saldo antes')}\n\n"
+        f"{format_balances_block(balances_after, person, title='Saldo depois')}"
+    )
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def recompensa_pontual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    person = get_user_name(user_id)
+
+    if person is None:
+        await update.message.reply_text("Você ainda não está registrado. Use /register <nome> primeiro.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /recompensa_pontual <valor> <descrição>")
+        return
+
+    try:
+        value = float(context.args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Valor inválido.")
+        return
+
+    amount = round(abs(value), 2)
+    description = f"recompensa pontual: {' '.join(context.args[1:])}"
+
+    balances_before = get_balances()
+    movement_id = create_movement(user_id, amount, description, now_local())
+    balances_after = get_balances()
+
+    text = (
+        f"🎁 <b>Movimentação #{movement_id}</b> ({description})\n\n"
         f"{format_balances_block(balances_before, title='Saldo antes')}\n\n"
         f"{format_balances_block(balances_after, person, title='Saldo depois')}"
     )
@@ -484,10 +433,10 @@ async def historico_ganhei(update: Update, extra_args: list[str]) -> None:
             await update.message.reply_text("Quantidade de dias inválida.")
             return
 
-    conn = get_connection()
-    people = [row[0] for row in conn.execute("SELECT name FROM users").fetchall()]
+    users = get_users()
+    ganhei_days = {user_id: get_ganhei_days(user_id) for user_id in users}
 
-    today = datetime.now().date()
+    today = now_local().date()
     lines = ["⭐️ <b>Dias ganhos/perdidos</b>"]
 
     for i in range(days - 1, -1, -1):
@@ -495,17 +444,13 @@ async def historico_ganhei(update: Update, extra_args: list[str]) -> None:
         day_iso = day.isoformat()
         date_str = day.strftime("%d/%m")
 
-        status_parts = []
-        for person in people:
-            won = conn.execute(
-                "SELECT COUNT(*) FROM movements WHERE person = ? AND description = ? AND date(movement_date) = ?",
-                (person, "ganhei", day_iso),
-            ).fetchone()[0]
-            status_parts.append(f"{person} {'✅' if won else '❌'}")
+        status_parts = [
+            f"{name} {'✅' if day_iso in ganhei_days[user_id] else '❌'}"
+            for user_id, name in users.items()
+        ]
 
         lines.append(f"{date_str} — " + " | ".join(status_parts))
 
-    conn.close()
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -527,44 +472,24 @@ async def historico(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Quantidade inválida.")
             return
 
-    conn = get_connection()
-    if exclude_ganhei:
-        rows = conn.execute(
-            """
-            SELECT id, person, amount, description, movement_date
-            FROM movements
-            WHERE description != ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            ("ganhei", limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT id, person, amount, description, movement_date
-            FROM movements
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    conn.close()
+    movements = list_movements(limit, exclude_ganhei)
 
-    if not rows:
+    if not movements:
         await update.message.reply_text("Nenhuma movimentação registrada ainda.")
         return
 
-    rows.reverse()
+    movements.reverse()
+    names = get_users()
 
     title = "📜 <b>Movimentações</b>" if exclude_ganhei else "📜 <b>Últimas movimentações</b>"
     lines = [title]
-    for movement_id, person, amount, description, movement_date in rows:
-        date_str = str(movement_date)[:16]
+    for movement in movements:
+        person = names.get(movement["user_id"], str(movement["user_id"]))
+        amount = movement["amount"]
         signal = "+" if amount >= 0 else ""
         lines.append(
-            f"\n#{movement_id} — {person} — {signal}{format_brl(amount)}\n"
-            f"{description}\n<i>{date_str}</i>"
+            f"\n#{movement['id']} — {person} — {signal}{format_brl(amount)}\n"
+            f"{movement['description']}\n<i>{format_dt(movement['movement_date'])}</i>"
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -581,27 +506,23 @@ async def verid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Id inválido.")
         return
 
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT id, person, amount, description, movement_date, created_at FROM movements WHERE id = ?",
-        (movement_id,),
-    ).fetchone()
-    conn.close()
+    movement = get_movement(movement_id)
 
-    if row is None:
+    if movement is None:
         await update.message.reply_text(f"Nenhuma movimentação com id {movement_id}.")
         return
 
-    movement_id, person, amount, description, movement_date, created_at = row
+    person = get_user_name(movement["user_id"]) or str(movement["user_id"])
+    amount = movement["amount"]
     signal = "+" if amount >= 0 else ""
 
     text = (
         f"🔍 <b>Movimentação #{movement_id}</b>\n\n"
         f"<b>Pessoa:</b> {person}\n"
         f"<b>Valor:</b> {signal}{format_brl(amount)}\n"
-        f"<b>Descrição:</b> {description}\n"
-        f"<b>Data do fato:</b> {str(movement_date)[:16]}\n"
-        f"<b>Registrado em:</b> {str(created_at)[:16]}"
+        f"<b>Descrição:</b> {movement['description']}\n"
+        f"<b>Data do fato:</b> {format_dt(movement['movement_date'])}\n"
+        f"<b>Registrado em:</b> {format_dt(movement['created_at'])}"
     )
 
     await update.message.reply_text(text, parse_mode="HTML")
@@ -620,28 +541,19 @@ async def editar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     new_description = " ".join(context.args[1:])
 
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT description FROM movements WHERE id = ?", (movement_id,)
-    ).fetchone()
+    movement = get_movement(movement_id)
 
-    if row is None:
-        conn.close()
+    if movement is None:
         await update.message.reply_text(f"Nenhuma movimentação com id {movement_id}.")
         return
 
-    old_description = row[0]
+    old_description = movement["description"]
 
     if old_description == "ganhei":
-        conn.close()
         await update.message.reply_text("Movimentações de /ganhei não podem ter a descrição editada.")
         return
 
-    conn.execute(
-        "UPDATE movements SET description = ? WHERE id = ?", (new_description, movement_id)
-    )
-    conn.commit()
-    conn.close()
+    update_movement_description(movement_id, new_description)
 
     await update.message.reply_text(
         f"<b>Movimentação #{movement_id}</b> atualizada.\n"

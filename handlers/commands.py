@@ -24,7 +24,7 @@ from utils import format_balances_block, format_brl, format_dt, now_local
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Bot no ar!!!")
+    await update.message.reply_text("Bot no ar via Github!!!")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
